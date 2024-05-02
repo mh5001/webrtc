@@ -1,0 +1,217 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=1, initial-scale=1.0">
+    <title>Private Stream</title>
+    <style>
+        body {
+            color: white;
+            background-color: black;
+        }
+    </style>
+</head>
+
+<body>
+    <video crossOrigin="anonymous" id="player" controls></video>
+    <span id="ping"></span>
+    <script src="/socket.io/socket.io.js"></script>
+    <script>
+        window.onload = () => {
+            const player = document.getElementById('player');
+            const socket = io();
+
+            const uncompressArrayBuffer = async (input) => {
+                const ds = new DecompressionStream("gzip");
+                const writer = ds.writable.getWriter();
+                writer.write(input);
+                writer.close();
+
+                const output = [];
+                let totalSize = 0;
+                const reader = ds.readable.getReader();
+
+                while (true) {
+                    const { value, done } = await reader.read();
+                    if (done) break;
+                    output.push(value);
+                    totalSize += value.byteLength;
+                }
+
+                const concatenated = new Uint8Array(totalSize);
+                let offset = 0;
+                for (const array of output) {
+                    concatenated.set(array, offset);
+                    offset += array.byteLength;
+                }
+
+                return concatenated;
+            };
+
+            function handleChunks(trackWriter, kind) {
+                const Construct = (kind === 'audio' ? AudioData : VideoFrame);
+                return async (value, bufferCompressed) => {
+                    const buffer = await uncompressArrayBuffer(bufferCompressed);
+                    let data = null;
+                    if (kind === 'audio') {
+                        data = new Construct({ ...value, data: buffer })
+                    } else {
+                        data = new Construct(buffer, value);
+                    }
+                    await trackWriter.write(data);
+                }
+            }
+
+            const compressArrayBuffer = async (input) => {
+                const cs = new CompressionStream("gzip");
+                const writer = cs.writable.getWriter();
+                writer.write(input);
+                writer.close();
+
+                const output = [];
+                let totalSize = 0;
+                const reader = cs.readable.getReader();
+
+                while (true) {
+                    const { value, done } = await reader.read();
+                    if (done) break;
+                    output.push(value);
+                    totalSize += value.byteLength;
+                }
+
+                const concatenated = new Uint8Array(totalSize);
+                let offset = 0;
+                for (const array of output) {
+                    concatenated.set(array, offset);
+                    offset += array.byteLength;
+                }
+
+                return concatenated;
+            };
+            let chunks = [];
+            function pipeStream(readable, trackId) {
+                const reader = readable.getReader();
+                return () => {
+                    const loopId = setInterval(async () => {
+                        const { done, value } = await reader.read();
+                        if (done) clearInterval(loopId);
+                        const { codedHeight,
+                            codedRect,
+                            codedWidth,
+                            colorSpace,
+                            displayHeight,
+                            displayWidth,
+                            duration,
+                            format,
+                            timestamp,
+                            numberOfFrames,
+                            sampleRate,
+                            numberOfChannels
+                        } = value;
+                        const option = { planeIndex: 0 };
+                        const size = value.allocationSize(option) * (numberOfChannels ?? 1) * 2;
+                        const buffer = new Uint8Array(size);
+                        await value.copyTo(buffer, option);
+                        const bufferCompressed = await compressArrayBuffer(buffer);
+                        if (!player.paused && chunks.length >= 60) {
+                            socket.emit('chunk', chunks);
+                            chunks.length = 0;
+                        } else {
+                            chunks.push({
+                                value: {
+                                    codedHeight,
+                                    codedRect,
+                                    codedWidth,
+                                    colorSpace,
+                                    displayHeight,
+                                    displayWidth,
+                                    duration,
+                                    format,
+                                    timestamp,
+                                    numberOfFrames,
+                                    sampleRate,
+                                    numberOfChannels
+                                }, bufferCompressed, trackId
+                            });
+                        }
+                        await value.close();
+                    }, 60);
+                }
+            }
+
+            delete window.io;
+            const roomId = location.href.match(/room\/(.*)\/?/)[1];
+            socket.emit('init', roomId);
+            socket.on('host', url => {
+                player.src = url;
+                player.addEventListener('canplay', () => {
+                    let stream = null;
+                    if (player.mozCaptureStream) {
+                        stream = player.mozCaptureStream();
+                    } else {
+                        stream = player.captureStream?.()
+                    }
+                    if (!stream) {
+                        alert('Browser don\'t support')
+                        return;
+                    }
+                    const tracks = stream.getTracks();
+                    socket.emit('tracks', tracks.map(({ id, kind, label }) => ({ id, kind, label })));
+                    for (const track of tracks) {
+                        const trackProcessor = new MediaStreamTrackProcessor({ track });
+                        const reader = trackProcessor.readable;
+                        setTimeout(pipeStream(reader, track.id));
+                    }
+                });
+            });
+            let isInit = true;
+            let played = 0;
+            socket.on('leech', tracks => {
+                const handler = {};
+                player.muted = true;
+                const stream = new MediaStream();
+                for (const track of tracks) {
+                    const trackGenerator = new MediaStreamTrackGenerator(track);
+                    stream.addTrack(trackGenerator);
+                    handler[track.id] = handleChunks(trackGenerator.writable.getWriter(), track.kind);
+                }
+                player.srcObject = stream;
+                const bufferChunks = [];
+                socket.on('chunk', async (chunks) => {
+                    if (isInit && player.paused) {
+                        player.play();
+                        setTimeout(() => {
+                            setInterval(async () => {
+                                // console.log(bufferChunks.length);
+                                // console.log(bufferChunks.length);
+                                if (!bufferChunks.length) {
+                                    console.log('out of buffer???');
+                                    return;
+                                }
+                                const [data] = bufferChunks.splice(0, 1);
+                                const { value, bufferCompressed, trackId } = data;
+                                await handler[trackId](value, bufferCompressed);
+                            }, 55);
+                        }, 20);
+                    }
+                    bufferChunks.push(...chunks);
+                    isInit = false;
+                });
+            });
+            setInterval(() => {
+                const start = Date.now();
+
+                socket.emit("ping", () => {
+                    const duration = Date.now() - start;
+                    document.getElementById('ping').innerText = `${duration} ms ping!`;
+                });
+            }, 1000);
+            socket.on('disconnect', () => {
+                alert('You got disconnected!');
+            });
+        }
+    </script>
+</body>
+
+</html>

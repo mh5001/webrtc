@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=1, initial-scale=1.0">
+    <title>Private Stream</title>
+    <style>
+        body {
+            color: white;
+            background-color: black;
+        }
+    </style>
+</head>
+
+<body>
+    <p>Create a room</p>
+    <form action="/room" method="post" id="creator">
+        <span>
+            <span>Video URL:</span>
+            <input type="url" name="url"
+                value="http://commondatastorage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4"></input>
+        </span>
+        <button type="submit">Submit</button>
+    </form>
+    <script>
+        window.addEventListener('keydown', ({ key }) => {
+            if (key === 'Enter') document.getElementById('creator').submit();
+        })
+    </script>
+</body>
+
+</html>
